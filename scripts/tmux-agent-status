@@ -1,0 +1,452 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["websockets==17.3"]
+# ///
+"""Claude and Codex status feed and native tmux sidebar."""
+
+import argparse
+import curses
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+from websockets.exceptions import WebSocketException
+from websockets.sync.client import unix_connect
+
+
+PANE_FIELDS = (
+    ("session", "session_name"), ("window", "window_index"),
+    ("window_name", "window_name"), ("pane", "pane_id"),
+    ("pid", "pane_pid"), ("tty", "pane_tty"),
+    ("command", "pane_current_command"), ("cwd", "pane_current_path"),
+)
+PALETTE = {"inactive": 7, "idle": 7, "unknown": 7, "error": 1,
+           "active": 7, "ready": 6, "needs_input": 1, "working": 3}
+PRIORITY = {"needs_input": 0, "working": 1, "ready": 2, "error": 3,
+            "idle": 4, "unknown": 5, "inactive": 6}
+SYMBOL = {"needs_input": "!", "working": "▶", "active": "●",
+          "ready": "✓", "idle": "○", "error": "×", "unknown": "?", "inactive": "·"}
+LABEL = {"needs_input": "Needs you", "working": "Working", "ready": "Ready", "active": "Active",
+         "inactive": "Inactive", "unknown": "Unknown", "error": "Error", "idle": "Seen"}
+SIDEBAR_TITLE = "tmux-agent-status"
+WIDTH = "30"
+
+
+def command(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=3).stdout
+
+
+def tmux(*args):
+    subprocess.run(("tmux",) + args, check=True)
+
+
+def tmux_panes():
+    fmt = "\t".join("#{" + field + "}" for _, field in PANE_FIELDS)
+    panes = []
+    for line in command("tmux", "list-panes", "-a", "-F", fmt).splitlines():
+        values = line.split("\t")
+        if len(values) != len(PANE_FIELDS):
+            continue
+        pane = dict(zip((name for name, _ in PANE_FIELDS), values))
+        pane["agent"] = pane["command"].lower()
+        if pane["agent"] in ("claude", "codex"):
+            pane.update(status="unknown", source="tmux", name=None, session_id=None, kind=None)
+            panes.append(pane)
+    return panes
+
+
+def tmux_sessions():
+    fmt = "\t".join(("#{session_id}", "#{session_name}"))
+    sessions = []
+    for line in command("tmux", "list-sessions", "-F", fmt).splitlines():
+        values = line.split("\t")
+        if len(values) == 2:
+            sessions.append(dict(zip(("id", "name"), values)))
+    return sessions
+
+
+def claude_sessions():
+    sessions = json.loads(command("claude", "agents", "--json", "--all"))
+    if not isinstance(sessions, list):
+        raise ValueError("Claude returned an invalid session list")
+    return sessions
+
+
+def claude_status(session):
+    state, status = session.get("state"), session.get("status")
+    if state == "blocked" or status == "waiting":
+        return "needs_input"
+    if state == "working" or status == "busy":
+        return "working"
+    return {"done": "ready", "failed": "error", "stopped": "inactive"}.get(
+        state, "ready" if status == "idle" else "unknown")
+
+
+def claude_ttys(sessions):
+    pids = [str(session["pid"]) for session in sessions if isinstance(session.get("pid"), int)]
+    if not pids:
+        return {}
+    output = command("ps", "-p", ",".join(pids), "-o", "pid=", "-o", "tty=")
+    return {int(pid): "/dev/" + tty.strip() for pid, tty in
+            (line.split(None, 1) for line in output.splitlines()) if tty != "??"}
+
+
+class CodexSocket:
+    """Read-only Codex app-server requests over its local WebSocket."""
+
+    def __init__(self):
+        path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "app-server-control/app-server-control.sock"
+        if not path.is_socket() or path.stat().st_uid != os.getuid():
+            raise OSError("Codex control socket is unavailable or not owned by this user")
+        self.ws = unix_connect(str(path), "ws://localhost/", legacy=True, open_timeout=2,
+                               close_timeout=1, max_size=4_000_000)
+        self.next_id = 0
+        try:
+            self.call("initialize", {"clientInfo": {
+                "name": "tmux_agent_status", "title": "tmux agent status", "version": "1"
+            }})
+            self.ws.send(json.dumps({"method": "initialized", "params": {}}))
+        except Exception:
+            self.ws.close()
+            raise
+
+    def close(self):
+        self.ws.close()
+
+    def call(self, method, params=None):
+        self.next_id += 1
+        self.ws.send(json.dumps({"method": method, "id": self.next_id,
+                                 "params": params if params is not None else {}}))
+        for _ in range(100):
+            reply = json.loads(self.ws.recv(timeout=2))
+            if reply.get("id") == self.next_id:
+                if "error" in reply:
+                    raise OSError("Codex " + method + ": " + reply["error"].get("message", "error"))
+                return reply["result"]
+        raise OSError("Codex did not answer " + method)
+
+
+def codex_status(status):
+    kind = status.get("type")
+    if kind == "active":
+        return "needs_input" if any(flag in status.get("activeFlags", []) for flag in
+            ("waitingOnApproval", "waitingOnUserInput")) else "working"
+    return {"idle": "ready", "notLoaded": "inactive", "systemError": "error"}.get(kind, "unknown")
+
+
+def codex_sessions():
+    client = CodexSocket()
+    try:
+        result = []
+        ids = []
+        cursor = None
+        while True:
+            page = client.call("thread/loaded/list", {"cursor": cursor} if cursor else {})
+            ids.extend(page.get("data", []))
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        for thread_id in ids:
+            thread = client.call("thread/read", {"threadId": thread_id})["thread"]
+            result.append({"agent": "codex", "session_id": thread_id,
+                           "name": thread.get("name"),
+                           "cwd": thread.get("cwd"),
+                           "status": codex_status(thread.get("status") or {}),
+                           "source": "codex_app_server", "pane": None})
+        return result
+    finally:
+        client.close()
+
+
+def snapshot():
+    data = {"version": 1, "time": int(time.time()), "panes": [], "sessions": [], "other_sessions": [], "errors": []}
+    try:
+        data["panes"] = tmux_panes()
+        data["sessions"] = tmux_sessions()
+    except (OSError, subprocess.SubprocessError) as error:
+        data["errors"].append("tmux: " + str(error))
+    try:
+        sessions = claude_sessions()
+        tty_by_pid = claude_ttys(sessions)
+        panes_by_tty = {pane["tty"]: pane for pane in data["panes"] if pane["agent"] == "claude"}
+        for session in sessions:
+            fields = dict(status=claude_status(session), source="claude_agents", name=session.get("name"),
+                          session_id=session.get("sessionId"), kind=session.get("kind"))
+            pane = panes_by_tty.get(tty_by_pid.get(session.get("pid")))
+            if pane:
+                pane.update(fields)
+            else:
+                data["other_sessions"].append(dict(fields, agent="claude", pane=None, cwd=session.get("cwd")))
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        data["errors"].append("claude: " + str(error))
+    try:
+        data["other_sessions"].extend(codex_sessions())
+    except (OSError, ValueError, KeyError, WebSocketException) as error:
+        data["errors"].append("codex: " + str(error))
+    return data
+
+
+def agent_key(item):
+    identity = item.get("session_id") or item.get("pane")
+    return f"{item['agent']}:{identity}" if identity else None
+
+
+def shown_status(item, state):
+    if state is not None and item["status"] == "ready" and state.get(agent_key(item)) != "ready":
+        return "idle"
+    return item["status"]
+
+
+def sidebar_rows(data, state=None, current_pane=None):
+    panes_by_session = defaultdict(list)
+    for pane in data["panes"]:
+        panes_by_session[pane["session"]].append(pane)
+    sessions = []
+    for session in data["sessions"]:
+        statuses = [pane["status"] for pane in panes_by_session[session["name"]]]
+        status = ("needs_input" if "needs_input" in statuses else
+                  "working" if "working" in statuses else
+                  "active" if statuses else "inactive")
+        sessions.append((session, status, f"{SYMBOL[status]} {session['name']}"))
+    agents = []
+    for item in data["panes"] + data["other_sessions"]:
+        label = item.get("name") or item.get("window_name") or (item.get("session_id") or item["agent"])[:8]
+        kind = " bg" if item.get("kind") == "background" else ""
+        status = shown_status(item, state)
+        agents.append((item, status, f"{SYMBOL[status]} {item['agent']}{kind} {label}"))
+    agents.sort(key=lambda row: (bool(current_pane) and row[0].get("pane") != current_pane,
+                                 PRIORITY.get(row[1], 9), row[0]["agent"], row[2].lower()))
+    return sessions, agents
+
+
+def save_state(state):
+    tmux("set-option", "-g", "@agent_sidebar_state", json.dumps(state, separators=(",", ":")))
+
+
+def update_read_state(data, state, active):
+    if data["errors"]:
+        return state
+    current = {}
+    for item in data["panes"] + data["other_sessions"]:
+        key = agent_key(item)
+        if not key:
+            continue
+        status = item["status"]
+        if status == "ready" and (state.get(key) in (None, "seen") or item.get("pane") == active):
+            status = "seen"
+        current[key] = status
+    if current != state:
+        save_state(current)
+    return current
+
+
+def pane_window(pane):
+    try:
+        return command("tmux", "display-message", "-p", "-t", pane, "#{window_id}").strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+# tmux gives a removed pane's whole width to one neighbour, so each open/close or
+# window switch would shrink the other panes. Save the layout on entry, restore on exit.
+def remember_layout(target):
+    layout = command("tmux", "display-message", "-p", "-t", target, "#{window_layout}").strip()
+    tmux("set-option", "-w", "-t", target, "@agent_sidebar_layout", layout)
+
+
+def restore_layout(window):
+    # ponytail: no-op (tmux error ignored) if panes were added/removed while the sidebar was there.
+    layout = command("tmux", "show-option", "-wqv", "-t", window, "@agent_sidebar_layout").strip()
+    return ("select-layout", "-t", window, layout) if layout else ("refresh-client",)
+
+
+def close_sidebar(pane, window):
+    # One tmux call: the server still runs select-layout after killing this very process.
+    tmux("set-option", "-gu", "@agent_sidebar_pane")
+    subprocess.run(("tmux", "kill-pane", "-t", pane, ";") + restore_layout(window), capture_output=True)
+
+
+def toggle(target, client):
+    existing = command("tmux", "show-option", "-gqv", "@agent_sidebar_pane").strip()
+    window = existing and pane_window(existing)
+    if window:
+        close_sidebar(existing, window)
+        return
+    remember_layout(target)
+    opened = command("tmux", "split-window", "-h", "-b", "-f", "-l", WIDTH,
+                     "-P", "-F", "#{pane_id}", "-T", SIDEBAR_TITLE,
+                     "-t", target, str(Path(__file__).resolve()), "--sidebar",
+                     "--client", client, "--right-pane", target).strip()
+    tmux("set-option", "-g", "@agent_sidebar_pane", opened)
+    tmux("select-pane", "-t", opened)
+
+
+def client_window(client):
+    # Pane-local display-message formats ignore -c, so inspect the client list instead.
+    for line in command("tmux", "list-clients", "-F",
+                        "#{client_tty}\t#{session_id}\t#{window_id}\t#{pane_id}").splitlines():
+        tty, session, window, active = line.split("\t", 3)
+        if tty == client:
+            return session, window, active
+    return None
+
+
+def follow(pane, window, target, focused):
+    if target == window:
+        return window
+    remember_layout(target)
+    # {top-left}: move-pane -f only spans the full height from the leftmost pane.
+    tmux("move-pane", "-h", "-b", "-f", "-d", "-l", WIDTH, "-s", pane, "-t", target + ".{top-left}")
+    subprocess.run(("tmux",) + restore_layout(window), capture_output=True)
+    if focused:
+        tmux("select-pane", "-t", pane)
+    return target
+
+
+def open_row(row, client, state=None):
+    item = row[0]
+    target = item.get("id") or item.get("pane")
+    if target:
+        tmux("switch-client", *(("-c", client) if client else ()), "-t", target)
+    if state is not None and row[1] == "ready" and agent_key(item):
+        state[agent_key(item)] = "seen"
+        save_state(state)
+    return "id" in item
+
+
+def draw(screen, y, text, attr=0):
+    try:
+        screen.addnstr(y, 0, text, max(0, screen.getmaxyx()[1] - 1), attr)
+    except curses.error:
+        pass
+
+
+def sidebar(screen, client, right_pane):
+    curses.curs_set(0)
+    colors = curses.has_colors()
+    if colors:
+        curses.start_color()
+        curses.use_default_colors()
+        options = command("tmux", "display-message", "-p",
+                          "#{@agent_sidebar_color_needs}\t#{@agent_sidebar_color_working}\t"
+                          "#{@agent_sidebar_color_ready}\t#{@agent_sidebar_color_current}")
+        for pair, value in zip((1, 3, 6, 4), options.rstrip("\n").split("\t")):
+            color = int(value) if value.isdecimal() and int(value) < curses.COLORS else pair
+            curses.init_pair(pair, color, -1)
+        curses.init_pair(7, 7, -1)
+    curses.mousemask(curses.BUTTON1_CLICKED)
+    screen.timeout(500)
+    pane = os.environ.get("TMUX_PANE")
+    window = pane_window(pane) if pane else None
+    try:
+        read_state = json.loads(command("tmux", "show-option", "-gqv", "@agent_sidebar_state") or "{}")
+        if not isinstance(read_state, dict):
+            read_state = {}
+    except ValueError:
+        read_state = {}
+    current_session = None
+    active = pane
+    focused = True
+    selected, offsets, section = [0, 0], [0, 0], 0
+    last, data = 0, None
+    while True:
+        if pane and client and window:
+            try:
+                attached = client_window(client)
+                if attached:
+                    current_session, target, active = attached
+                    if active != pane:
+                        right_pane = active
+                    if target == window:
+                        focused = active == pane
+                    else:
+                        window = follow(pane, window, target, focused)
+                else:
+                    active = None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        if time.monotonic() - last >= 2:
+            data = snapshot()
+            last = time.monotonic()
+        read_state = update_read_state(data, read_state, active)
+        sections = sidebar_rows(data, read_state, right_pane)
+        height, width = screen.getmaxyx()
+        middle = max(3, height // 2)
+        regions = ((1, middle - 1), (middle + 1, height - 2))
+        screen.erase()
+        draw(screen, middle - 1, "─" * width, curses.A_DIM)
+        for group, (top, bottom) in enumerate(regions):
+            rows = sections[group]
+            visible = max(0, bottom - top)
+            selected[group] = min(selected[group], max(0, len(rows) - 1))
+            offsets[group] = min(offsets[group], max(0, len(rows) - visible))
+            if selected[group] < offsets[group]:
+                offsets[group] = selected[group]
+            if selected[group] >= offsets[group] + visible and visible:
+                offsets[group] = selected[group] - visible + 1
+            draw(screen, top - 1, "AGENTS" if group else "WORKSPACES", curses.A_BOLD)
+            for y, row in enumerate(rows[offsets[group]:offsets[group] + visible], top):
+                current = (row[0].get("id") == current_session if group == 0 else
+                           bool(right_pane) and row[0].get("pane") == right_pane)
+                attr = curses.color_pair(4 if current else PALETTE[row[1]]) if colors else 0
+                if current:
+                    attr |= curses.A_BOLD
+                elif row[1] in ("active", "inactive", "idle", "unknown"):
+                    attr |= curses.A_DIM
+                if group == section and offsets[group] + y - top == selected[group]:
+                    attr = (attr | curses.A_UNDERLINE) if current else curses.A_REVERSE
+                draw(screen, y, ("› " if current else "  ") + row[2], attr)
+        item, status = sections[section][selected[section]][:2] if sections[section] else ({}, "inactive")
+        action = "seen" if section and status == "ready" and not item.get("pane") else "open"
+        footer = "Source error; JSON for details" if data["errors"] else f"{LABEL[status]}  Tab  ↵ {action}  q"
+        draw(screen, height - 1, footer, curses.A_DIM)
+        screen.refresh()
+        key = screen.getch()
+        if key in (ord("q"), 27):
+            if pane and window:
+                close_sidebar(pane, window)
+            break
+        if key == 9:
+            section = 1 - section
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected[section] = min(selected[section] + 1, max(0, len(sections[section]) - 1))
+        elif key in (curses.KEY_UP, ord("k")):
+            selected[section] = max(0, selected[section] - 1)
+        elif key in (10, 13, curses.KEY_ENTER) and sections[section]:
+            focused = open_row(sections[section][selected[section]], client, read_state)
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, button = curses.getmouse()
+                if button & curses.BUTTON1_CLICKED:
+                    for group, (top, bottom) in enumerate(regions):
+                        index = offsets[group] + y - top
+                        if top <= y < bottom and index < len(sections[group]):
+                            section, selected[group] = group, index
+                            focused = open_row(sections[group][index], client, read_state)
+            except curses.error:
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="print one machine-readable snapshot")
+    parser.add_argument("--toggle", metavar="PANE", help="toggle the client sidebar")
+    parser.add_argument("--client", help=argparse.SUPPRESS)
+    parser.add_argument("--right-pane", help=argparse.SUPPRESS)
+    parser.add_argument("--sidebar", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.toggle:
+        toggle(args.toggle, args.client or "")
+    elif args.sidebar or (not args.json and sys.stdout.isatty()):
+        curses.wrapper(sidebar, args.client or "", args.right_pane)
+    else:
+        print(json.dumps(snapshot(), ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
