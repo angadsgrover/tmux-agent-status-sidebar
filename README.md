@@ -24,6 +24,22 @@ Reload tmux, then press `prefix + I` to install the plugin.
 
 Press `prefix + o` to open or close the sidebar. Use `Tab` to switch sections, `j` and `k` to move, `Enter` to open a row, and `q` to close it.
 
+To change the sidebar shortcut, set `@agent_sidebar_key` before the TPM line. For example, this uses `prefix + O`:
+
+```tmux
+set -g @agent_sidebar_key 'O'
+```
+
+Reload tmux after you change the option. The plugin uses your existing tmux prefix.
+
+The sidebar is 30 columns wide by default. Set `@agent_sidebar_width` before the TPM line to change it:
+
+```tmux
+set -g @agent_sidebar_width '36'
+```
+
+Use a width of at least 10 columns. The plugin uses 30 columns for smaller values.
+
 ## Colors
 
 The sidebar uses the terminal background. You can set four tmux options before the TPM line to change its status colors. Each value is a terminal color number from `0` to `255`.

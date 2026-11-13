@@ -37,6 +37,11 @@ SIDEBAR_TITLE = "tmux-agent-status"
 WIDTH = "30"
 
 
+def sidebar_width():
+    value = command("tmux", "show-option", "-gqv", "@agent_sidebar_width").strip()
+    return value if value.isdecimal() and int(value) >= 10 else WIDTH
+
+
 def command(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=3).stdout
 
@@ -278,7 +283,7 @@ def toggle(target, client):
         close_sidebar(existing, window)
         return
     remember_layout(target)
-    opened = command("tmux", "split-window", "-h", "-b", "-f", "-l", WIDTH,
+    opened = command("tmux", "split-window", "-h", "-b", "-f", "-l", sidebar_width(),
                      "-P", "-F", "#{pane_id}", "-T", SIDEBAR_TITLE,
                      "-t", target, str(Path(__file__).resolve()), "--sidebar",
                      "--client", client, "--right-pane", target).strip()
@@ -301,7 +306,7 @@ def follow(pane, window, target, focused):
         return window
     remember_layout(target)
     # {top-left}: move-pane -f only spans the full height from the leftmost pane.
-    tmux("move-pane", "-h", "-b", "-f", "-d", "-l", WIDTH, "-s", pane, "-t", target + ".{top-left}")
+    tmux("move-pane", "-h", "-b", "-f", "-d", "-l", sidebar_width(), "-s", pane, "-t", target + ".{top-left}")
     subprocess.run(("tmux",) + restore_layout(window), capture_output=True)
     if focused:
         tmux("select-pane", "-t", pane)
